@@ -46,7 +46,7 @@ namespace Modules
 
                 if (delta <= 1)  // Same-tick (0) or consecutive (1) = DT in CS2
                 {
-                    _core.PlayerManager.SendChat($" \x07[AC]\x01 {player.PlayerName}\x0B detected using Doubletap! (delta {delta})");
+                  _core.PlayerManager.SendChat($"{Helper.ChatColors.Red}[AC] {Helper.ChatColors.Green}{player.PlayerName} detected using {Helper.ChatColors.Red}Doubletap!");
                 }
             }
 
