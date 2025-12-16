@@ -1,6 +1,3 @@
-﻿// Updated SilentAimModule.cs - Now detects NoSpread (rage) via low bullet deviation variance
-// Also logs for AutoStrafe potential (needs velocity checks)
-
 using AC;
 using SwiftlyS2.Shared;
 using SwiftlyS2.Shared.GameEventDefinitions;
