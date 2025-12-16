@@ -14,5 +14,7 @@
   <h1>Description</h3>
   <p>So far tested with Fatality and DoubleTap — get fully detected. Silent aim works fine in most cases but could use a bit more tuning for perfection. Very low false positives overall.</p>
 
+  Showcase: https://www.youtube.com/watch?v=hxyCdBdKyqg
+  
   If you want to buy me cofee: https://ko-fi.com/0yzys0
 </div>
