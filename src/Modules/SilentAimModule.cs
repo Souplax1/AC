@@ -1,195 +1,228 @@
 using AC;
 using SwiftlyS2.Shared;
+using SwiftlyS2.Shared.Events;
 using SwiftlyS2.Shared.GameEventDefinitions;
 using SwiftlyS2.Shared.GameEvents;
 using SwiftlyS2.Shared.Misc;
-using SwiftlyS2.Shared.Players;
-using SwiftlyS2.Shared.SchemaDefinitions;
 using SwiftlyS2.Shared.Natives;
+using SwiftlyS2.Shared.ProtobufDefinitions;
+using SwiftlyS2.Shared.SchemaDefinitions;
 using System;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace Modules
 {
-    public struct FireData
-    {
-        public QAngle Angles;
-        public Vector EyePos;
-        public DateTime Time;
-    }
-
     public class SilentAimModule : ModularAntiCheat.IAcModule
     {
-        private ModularAntiCheat _plugin = null!;
+        private const int StrikesToFlag = 2;
+        private const int SuspicionWindowCommands = 64;
+        private const int ReportCooldownCommands = 48;
+
         private ISwiftlyCore _core = null!;
-        private readonly Dictionary<ulong, FireData> _lastFireData = new(); // Use SteamID for key
-        private readonly Dictionary<ulong, List<float>> _deviations = new(); // Recent deviations per player
-        private readonly Dictionary<ulong, int> _violations = new();
-        private readonly Dictionary<ulong, DateTime> _lastViolationTime = new();
+        private Guid _disconnectHook;
+
+        private readonly Dictionary<ulong, ViewSample> _lastView = new();
+        private readonly Dictionary<ulong, Suspicion> _suspicion = new();
+        private readonly Dictionary<ulong, SnapWatch> _snap = new();
+
         public void Load(ModularAntiCheat plugin, ISwiftlyCore core)
         {
-            _plugin = plugin;
             _core = core;
-            _core.GameEvent.HookPost<EventWeaponFire>(OnWeaponFire);
-            _core.GameEvent.HookPost<EventBulletImpact>(OnBulletImpact); // Fixed name
-            _core.GameEvent.HookPost<EventPlayerHurt>(OnPlayerHurt); // Keep for future
-            _core.GameEvent.HookPost<EventPlayerDisconnect>(OnPlayerDisconnect);
+            _core.Event.OnClientProcessUsercmds += OnUsercmds;
+            _disconnectHook = _core.GameEvent.HookPost<EventPlayerDisconnect>(OnPlayerDisconnect);
         }
 
         public void Unload()
         {
-            _lastFireData.Clear();
-            _deviations.Clear();
-            _violations.Clear();
-            _lastViolationTime.Clear();
+            _core.Event.OnClientProcessUsercmds -= OnUsercmds;
+            _core.GameEvent.Unhook(_disconnectHook);
+            _lastView.Clear();
+            _suspicion.Clear();
+            _snap.Clear();
         }
 
-        private HookResult OnWeaponFire(EventWeaponFire @event)
+        private void OnUsercmds(IOnClientProcessUsercmdsEvent args)
         {
-            var player = @event.UserIdController;
-            if (player == null || !player.IsValid) return HookResult.Continue;
-            var pawn = player.Pawn.Value;
-            if (pawn == null) return HookResult.Continue;
+            var player = _core.PlayerManager.GetPlayer(args.PlayerId);
+            if (player == null || !player.IsValid || player.IsFakeClient)
+                return;
 
-            ulong steamId = player.SteamID; // Assume SteamID available - adjust if Controller.SteamID
-            var eyeAngles = @event.UserIdPawn.EyeAngles;
-            var eyePosNullable = pawn.EyePosition;
-            if (!eyePosNullable.HasValue)
-                return HookResult.Continue;
-            var eyePos = eyePosNullable.Value;
+            ulong steamId = player.SteamID;
+            if (steamId == 0)
+                return;
 
-            _lastFireData[steamId] = new FireData { Angles = eyeAngles, EyePos = eyePos, Time = DateTime.Now };
-
-            // Debug chat
-            //_core.PlayerManager.SendChatEOT($"QAngle({eyeAngles.Pitch:F6}, {eyeAngles.Yaw:F5}, {eyeAngles.Roll:F1})");
-
-            return HookResult.Continue;
-        }
-
-        private HookResult OnBulletImpact(EventBulletImpact @event)
-        {
-            var shooterController = _core.PlayerManager.GetPlayer(@event.UserId);
-            if (shooterController == null || !shooterController.IsValid || shooterController.IsFakeClient) return HookResult.Continue;
-
-            ulong steamId = shooterController.SteamID;
-            if (!_lastFireData.TryGetValue(steamId, out FireData fireData)) return HookResult.Continue;
-
-            var pawn = shooterController.PlayerPawn;
-            if (pawn == null) return HookResult.Continue;
- 
-
-            // Skip if player is in air (jumping shots have wild spread)
-            if (!pawn.OnGroundLastTick)
+            foreach (CSGOUserCmdPB cmd in args.Usercmds)
             {
-                return HookResult.Continue; // Ignore airborne shots
-            }
+                CBaseUserCmdPB? basis = cmd.Base;
+                if (basis == null)
+                    continue;
 
-            Vector eyePos = fireData.EyePos;
-            Vector impactPos = new Vector(@event.X, @event.Y, @event.Z);
+                QAngle view = basis.Viewangles;
+                bool attacking = IsAttacking(basis);
 
-            // Optional: Ignore very far or very close impacts (tune as needed)
-            float distance = (impactPos - eyePos).Length();
-            if (distance < 100 || distance > 10000) return HookResult.Continue;
-
-            Vector dirToImpact = (impactPos - eyePos).Normalized();
-            fireData.Angles.ToDirectionVectors(out Vector forward, out _, out _);
-
-            float dot = Vector.Dot(forward, dirToImpact);
-            dot = Math.Clamp(dot, -1f, 1f);
-            float deviation = (float)(Math.Acos(dot) * (180.0 / Math.PI));
-
-            // Debug
-            float speed = pawn.AbsVelocity.Length();
-            //_core.PlayerManager.SendConsole($"Bullet: {deviation:F3}° | Speed {speed:F1} units/s");
-
-            float HIGH_DEVIATION_THRESHOLD = GetHighDeviationThreshold(shooterController.RequiredController);  // Safe: legit rarely >10° when standing
-            const int REQUIRED_HIGH_DEVS = 3;             // 3+ bullets with high dev → detect
-
-            // Track high-deviation bullets
-            if (!_deviations.TryGetValue(steamId, out var highDevs))
-            {
-                highDevs = new List<float>();
-                _deviations[steamId] = highDevs;
-            }
-
-            if (deviation > HIGH_DEVIATION_THRESHOLD)
-            {
-                highDevs.Add(deviation);
-                if (highDevs.Count > 10) highDevs.RemoveAt(0);
-
-                //_core.PlayerManager.SendChat($"[AC] High deviation: {deviation:F2}° on {shooterController.RequiredController.PlayerName}");
-
-                if (highDevs.Count >= REQUIRED_HIGH_DEVS)
+                if (_snap.TryGetValue(steamId, out SnapWatch watch))
                 {
-                    _violations[steamId] = (_violations.GetValueOrDefault(steamId) + 1);
+                    if (SilentAimMath.IsSnapBack(watch.PrePitch, watch.PreYaw, watch.ShotPitch, watch.ShotYaw, view.X, view.Y))
+                        AddStrike(player, steamId);
+                    _snap.Remove(steamId);
+                }
 
-                    if (_violations[steamId] >= 3) // 3 bursts of high dev → kick
+                if (attacking && _lastView.TryGetValue(steamId, out ViewSample previous))
+                {
+                    bool haveShot = TryGetShotAngles(cmd, out QAngle shot) && HasAngle(shot, view);
+                    if (haveShot)
                     {
-                        _core.PlayerManager.SendChat($"{Helper.ChatColors.Red}[AC] {Helper.ChatColors.Default}Rage func detected on {Helper.ChatColors.Green}{shooterController.RequiredController.PlayerName}");
-                       // shooterController.Kick("Rage Func Detected",
-                       //     SwiftlyS2.Shared.ProtobufDefinitions.ENetworkDisconnectionReason.NETWORK_DISCONNECT_KICKED);
-
-                        // Cleanup
-                        _deviations.Remove(steamId);
-                        _violations.Remove(steamId);
+                        Sample(cmd, previous, view, out float beforePitch, out float beforeYaw, out float afterPitch, out float afterYaw);
+                        float excess = SilentAimMath.PathExcess(beforePitch, beforeYaw, shot.X, shot.Y, afterPitch, afterYaw);
+                        if (SilentAimMath.IsSuspiciousExcess(excess))
+                            AddStrike(player, steamId);
                     }
+
+                    float aimPitch = haveShot ? shot.X : view.X;
+                    float aimYaw = haveShot ? shot.Y : view.Y;
+                    float jump = SilentAimMath.AngleDelta(previous.Pitch, previous.Yaw, aimPitch, aimYaw);
+                    if (jump >= SilentAimMath.SnapJumpDegrees)
+                    {
+                        _snap[steamId] = new SnapWatch
+                        {
+                            PrePitch = previous.Pitch,
+                            PreYaw = previous.Yaw,
+                            ShotPitch = aimPitch,
+                            ShotYaw = aimYaw,
+                        };
+                    }
+                }
+
+                Touch(steamId);
+                _lastView[steamId] = new ViewSample { Pitch = view.X, Yaw = view.Y };
+            }
+        }
+
+        private static bool IsAttacking(CBaseUserCmdPB basis)
+        {
+            CInButtonStatePB? buttons = basis.ButtonsPb;
+            if (buttons == null)
+                return false;
+            return (buttons.Buttonstate1 & (ulong)InputBitMask_t.IN_ATTACK) != 0;
+        }
+
+        private static bool TryGetShotAngles(CSGOUserCmdPB cmd, out QAngle shot)
+        {
+            shot = default;
+            var history = cmd.InputHistory;
+            if (history == null)
+                return false;
+
+            int index = cmd.Attack1StartHistoryIndex;
+            if (index < 0 || index >= history.Count)
+                return false;
+
+            shot = history.Get(index).ViewAngles;
+            return true;
+        }
+
+        // Missing protobuf angles arrive as 0,0,0. That is a real aim only when the
+        // player is actually looking there.
+        private static bool HasAngle(QAngle angle, QAngle view)
+        {
+            bool zero = MathF.Abs(angle.X) < 0.001f && MathF.Abs(angle.Y) < 0.001f;
+            if (!zero)
+                return true;
+            return SilentAimMath.AngleDelta(0f, 0f, view.X, view.Y) <= 2f;
+        }
+
+        private static void Sample(CSGOUserCmdPB cmd, ViewSample previous, QAngle view, out float beforePitch, out float beforeYaw, out float afterPitch, out float afterYaw)
+        {
+            int index = cmd.Attack1StartHistoryIndex;
+            var history = cmd.InputHistory;
+            if (history == null)
+            {
+                beforePitch = previous.Pitch;
+                beforeYaw = previous.Yaw;
+                afterPitch = view.X;
+                afterYaw = view.Y;
+                return;
+            }
+
+            if (index > 0)
+            {
+                QAngle before = history.Get(index - 1).ViewAngles;
+                if (HasAngle(before, view))
+                {
+                    beforePitch = before.X;
+                    beforeYaw = before.Y;
+                }
+                else
+                {
+                    beforePitch = previous.Pitch;
+                    beforeYaw = previous.Yaw;
                 }
             }
             else
             {
-                // Legit shot — reduce suspicion slightly
-                highDevs.Clear(); // Reset on good shot
+                beforePitch = previous.Pitch;
+                beforeYaw = previous.Yaw;
             }
 
-            return HookResult.Continue;
-        }
-
-        private float GetHighDeviationThreshold(CCSPlayerController player)
-        {
-            var pawn = player.PlayerPawn.Value;
-            if (pawn == null) return 15f; // Default fallback
-
-            var activeWeapon = pawn.WeaponServices?.ActiveWeapon.Value;
-            if (activeWeapon == null ) return 15f;
-
-            string weaponName = activeWeapon.DesignerName; // e.g., "weapon_ak47", "weapon_deagle"
-
-            return weaponName switch
+            if (index + 1 < history.Count)
             {
-                // Rifles - tight spread
-                "weapon_ak47" or "weapon_m4a1" or "weapon_m4a1_silencer" or
-                "weapon_galilar" or "weapon_famas" or "weapon_aug" or "weapon_sg556" => 12f,
-
-                // Precision rifles
-                "weapon_awp" or "weapon_ssg08" => 2f,
-
-                // Autosnipers
-                "weapon_g3sg1" or "weapon_scar20" => 12f,
-
-                // High-inaccuracy pistols
-                "weapon_deagle" or "weapon_revolver" => 4f,
-
-                // Standard pistols
-                "weapon_glock" or "weapon_hkp2000" or "weapon_usp_silencer" or
-                "weapon_elite" or "weapon_p250" or "weapon_tec9" or "weapon_fiveseven" or "weapon_cz75a" => 3.8f,
-
-                // SMGs - very high spread
-                "weapon_mac10" or "weapon_mp9" or "weapon_mp7" or "weapon_mp5sd" or
-                "weapon_ump45" or "weapon_p90" or "weapon_bizon" => 22f,
-
-                // Shotguns - ignore almost entirely
-                "weapon_nova" or "weapon_xm1014" or "weapon_sawedoff" or "weapon_mag7" or "weapon_m249" or "weapon_negev" => 13f,
-
-                // Default catch-all
-                _ => 15f
-            };
+                QAngle after = history.Get(index + 1).ViewAngles;
+                if (HasAngle(after, view))
+                {
+                    afterPitch = after.X;
+                    afterYaw = after.Y;
+                }
+                else
+                {
+                    afterPitch = view.X;
+                    afterYaw = view.Y;
+                }
+            }
+            else
+            {
+                afterPitch = view.X;
+                afterYaw = view.Y;
+            }
         }
 
-        private HookResult OnPlayerHurt(EventPlayerHurt @event)
+        private void AddStrike(SwiftlyS2.Shared.Players.IPlayer player, ulong steamId)
         {
-            // Existing logic or extend for hit-based checks
-            return HookResult.Continue;
+            Suspicion state = Get(steamId);
+            if (state.Cooldown > 0)
+                return;
+
+            state.Strikes++;
+            state.SinceSuspicious = 0;
+            if (state.Strikes >= StrikesToFlag)
+            {
+                string name = player.Controller?.PlayerName ?? "player";
+                _core.PlayerManager.SendChat($"{Helper.ChatColors.Red}[AC] {Helper.ChatColors.Green}{name} detected using {Helper.ChatColors.Red}Silent Aim!");
+                state.Strikes = 0;
+                state.Cooldown = ReportCooldownCommands;
+            }
+
+            _suspicion[steamId] = state;
+        }
+
+        private void Touch(ulong steamId)
+        {
+            if (!_suspicion.TryGetValue(steamId, out Suspicion state))
+                return;
+
+            if (state.Cooldown > 0)
+                state.Cooldown--;
+
+            state.SinceSuspicious++;
+            if (state.SinceSuspicious > SuspicionWindowCommands)
+                state.Strikes = 0;
+
+            _suspicion[steamId] = state;
+        }
+
+        private Suspicion Get(ulong steamId)
+        {
+            _suspicion.TryGetValue(steamId, out Suspicion state);
+            return state;
         }
 
         private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event)
@@ -198,12 +231,33 @@ namespace Modules
             if (player != null)
             {
                 ulong steamId = player.SteamID;
-                _lastFireData.Remove(steamId);
-                _deviations.Remove(steamId);
-                _violations.Remove(steamId);
-                _lastViolationTime.Remove(steamId);
+                _lastView.Remove(steamId);
+                _suspicion.Remove(steamId);
+                _snap.Remove(steamId);
             }
+
             return HookResult.Continue;
+        }
+
+        private struct ViewSample
+        {
+            public float Pitch;
+            public float Yaw;
+        }
+
+        private struct Suspicion
+        {
+            public int Strikes;
+            public int SinceSuspicious;
+            public int Cooldown;
+        }
+
+        private struct SnapWatch
+        {
+            public float PrePitch;
+            public float PreYaw;
+            public float ShotPitch;
+            public float ShotYaw;
         }
     }
 }
