@@ -89,8 +89,9 @@ namespace Modules
             look.ToDirectionVectors(out Vector forward, out _, out _);
             float error = NoSpreadMath.DirectionError(forward.X, forward.Y, forward.Z, @event.DamageDirX, @event.DamageDirY, @event.DamageDirZ);
             float cone = NoSpreadMath.ConeDegrees(@event.InaccuracyTotal);
+            float horizontalSpeed = HorizontalSpeed(player);
 
-            if (NoSpreadMath.IsTightHit(cone, error))
+            if (NoSpreadMath.IsSuspicious(cone, error, @event.InAir, horizontalSpeed))
             {
                 state.Streak++;
                 if (state.Streak >= NoSpreadMath.HitsToFlag)
@@ -108,6 +109,16 @@ namespace Modules
 
             _suspicion[steamId] = state;
             return HookResult.Continue;
+        }
+
+        private static float HorizontalSpeed(SwiftlyS2.Shared.Players.IPlayer player)
+        {
+            var pawn = player.PlayerPawn;
+            if (pawn == null)
+                return 0f;
+
+            Vector velocity = pawn.AbsVelocity;
+            return MathF.Sqrt((velocity.X * velocity.X) + (velocity.Y * velocity.Y));
         }
 
         private Suspicion Get(ulong steamId)
