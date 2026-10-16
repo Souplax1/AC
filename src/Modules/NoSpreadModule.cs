@@ -21,6 +21,7 @@ namespace Modules
         private Guid _disconnectHook;
 
         private readonly Dictionary<ulong, ViewSample> _heldView = new();
+        private readonly Dictionary<ulong, ViewSample> _previousView = new();
         private readonly Dictionary<ulong, Suspicion> _suspicion = new();
 
         public void Load(ModularAntiCheat plugin, ISwiftlyCore core)
@@ -37,6 +38,7 @@ namespace Modules
             _core.GameEvent.Unhook(_damageHook);
             _core.GameEvent.Unhook(_disconnectHook);
             _heldView.Clear();
+            _previousView.Clear();
             _suspicion.Clear();
         }
 
@@ -57,6 +59,8 @@ namespace Modules
                     continue;
 
                 QAngle view = basis.Viewangles;
+                if (_heldView.TryGetValue(steamId, out ViewSample current))
+                    _previousView[steamId] = current;
                 _heldView[steamId] = new ViewSample { Pitch = view.X, Yaw = view.Y };
             }
         }
@@ -85,9 +89,10 @@ namespace Modules
                 return HookResult.Continue;
             }
 
-            var look = new QAngle { X = held.Pitch, Y = held.Yaw, Z = 0f };
-            look.ToDirectionVectors(out Vector forward, out _, out _);
-            float error = NoSpreadMath.DirectionError(forward.X, forward.Y, forward.Z, @event.DamageDirX, @event.DamageDirY, @event.DamageDirZ);
+            float error = ViewError(held, @event.DamageDirX, @event.DamageDirY, @event.DamageDirZ);
+            // The firing command carries the compensated angle. The command before it is still the aim the bullet was solved toward.
+            if (_previousView.TryGetValue(steamId, out ViewSample prior))
+                error = MathF.Min(error, ViewError(prior, @event.DamageDirX, @event.DamageDirY, @event.DamageDirZ));
             float cone = NoSpreadMath.ConeDegrees(@event.InaccuracyTotal);
             float horizontalSpeed = HorizontalSpeed(player);
 
@@ -109,6 +114,13 @@ namespace Modules
 
             _suspicion[steamId] = state;
             return HookResult.Continue;
+        }
+
+        private static float ViewError(ViewSample view, float bulletX, float bulletY, float bulletZ)
+        {
+            var look = new QAngle { X = view.Pitch, Y = view.Yaw, Z = 0f };
+            look.ToDirectionVectors(out Vector forward, out _, out _);
+            return NoSpreadMath.DirectionError(forward.X, forward.Y, forward.Z, bulletX, bulletY, bulletZ);
         }
 
         private static float HorizontalSpeed(SwiftlyS2.Shared.Players.IPlayer player)
@@ -134,6 +146,7 @@ namespace Modules
             {
                 ulong steamId = player.SteamID;
                 _heldView.Remove(steamId);
+                _previousView.Remove(steamId);
                 _suspicion.Remove(steamId);
             }
 
