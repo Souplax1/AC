@@ -19,6 +19,7 @@ namespace AC
         {
             _modules.Add(new Modules.DoubletapModule());
             _modules.Add(new Modules.SilentAimModule());
+            _modules.Add(new Modules.NoSpreadModule());
             // Add more modules here later, e.g.:
             // _modules.Add(new Modules.AimbotModule());
 
